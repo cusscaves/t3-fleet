@@ -6,7 +6,7 @@ Two directions. The defaults are built so a mistake costs little.
 
 **What Cuss will ask you for**
 - What it runs (Mac / Windows / Linux) and a short name for it (e.g. `jake-pc`).
-- That it can stay on and plugged in (8 GB RAM or more is plenty).
+- That it can stay on and plugged in (anything from 8 to 128 GB RAM works).
 - That you're OK with the access below.
 
 **What you get from Cuss**

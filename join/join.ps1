@@ -39,7 +39,7 @@ This will:
   2. Turn on Windows' SSH server and let $Owner's key log in as you ($env:USERNAME).
   3. Install Node.js, Git, Claude Code and T3 Code (runs in the background).
   4. Add Linux: Ubuntu 24.04 LTS inside Windows (WSL2), set up the same way.
-     On PCs with 16 GB RAM or less, Linux is capped at half the RAM.
+     Linux gets half the RAM on smaller PCs, more on big ones (Windows keeps 16 GB).
   5. Keep the PC awake while plugged in, so it stays reachable.
   (May ask for ONE restart - log back in, click Yes, and it continues.)
 
@@ -147,8 +147,10 @@ try {
     Say 'Setting up Linux (Ubuntu 24.04 LTS in WSL2)...'
     $wslCfg = "$HOME\.wslconfig"
     $ramGB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
-    if (-not (Test-Path $wslCfg) -and $ramGB -le 16) {
-      Set-Content $wslCfg "[wsl2]`nmemory=$([math]::Max(2, [math]::Floor($ramGB / 2)))GB`n"
+    if (-not (Test-Path $wslCfg)) {
+      # 8-32 GB: half for Linux; bigger: everything but 16 GB (64 -> 48, 128 -> 112)
+      $linGB = [math]::Max([math]::Floor($ramGB / 2), $ramGB - 16)
+      Set-Content $wslCfg "[wsl2]`nmemory=${linGB}GB`n"
     }
     $vmp = (Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform).State
     $wsl = (Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Windows-Subsystem-Linux).State

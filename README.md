@@ -17,7 +17,7 @@ self-healing. Friends can lend a spare computer in about five minutes.
 
 ## Join
 
-**Lending Cuss a computer?** Mac, Windows or Linux, 8 GB RAM or more.
+**Lending Cuss a computer?** Mac, Windows or Linux, 8 to 128 GB RAM.
 Read [what you're agreeing to](docs/CONNECT.md#if-youre-lending-a-computer) first (2 minutes).
 You need the **invite code** Cuss sent you privately.
 
