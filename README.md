@@ -19,6 +19,7 @@ self-healing. Friends can lend a spare computer in about five minutes.
 
 **Lending Cuss a computer?** Mac, Windows or Linux, 8 to 128 GB RAM.
 Read [what you're agreeing to](docs/CONNECT.md#if-youre-lending-a-computer) first (2 minutes).
+Prefer a friendly version? [Google Doc: Lend Cuss a computer](https://docs.google.com/document/d/1fh6q6QeG0WPY0TOQu4f9Ce5M67Fyj6ulQxyY9vzFZWE/edit?usp=sharing)
 You need the **invite code** Cuss sent you privately.
 
 **Windows** (sets up Windows *and* Ubuntu Linux): click Start, type `PowerShell`, open it, paste:

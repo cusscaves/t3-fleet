@@ -19,7 +19,7 @@ cat <<EOF
 
 Send these two things to them (the code privately):
 
-  1. The link:  https://github.com/cusscaves/t3-fleet#join
+  1. The guide: https://docs.google.com/document/d/1fh6q6QeG0WPY0TOQu4f9Ce5M67Fyj6ulQxyY9vzFZWE/edit?usp=sharing
   2. Their code (expires with the key, ~1 day):
 
 $CODE
