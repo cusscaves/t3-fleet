@@ -1,0 +1,14 @@
+# fleet-watch machine list. Copy to fleet.conf (Mac) / fleet.<hostname>.conf (other watchers).
+# name   = first label of the Tailscale DNS name (see `tailscale status`)
+# role   = self | server | box | laptop | phone
+#          self/server/box alert when unreachable; laptop only when online-but-broken; phone never
+# ssh    = ~/.ssh/config alias to test (and repair through), or -
+# t3     = T3 Code URL that must return 200, or -
+# repair = systemd-user (restart t3code.service + tailscale serve over ssh)
+#          systemd-local (restart t3code.service on this host) | mac-app (reopen T3 on this Mac) | -
+#
+# name          role    ssh     t3                                    repair
+my-mac          self    -       http://127.0.0.1:3773/                mac-app
+my-server       server  server  https://my-server.<tailnet>.ts.net/   systemd-user
+friend-pc       box     friend  https://friend-pc.<tailnet>.ts.net/   -
+my-phone        phone   -       -                                     -

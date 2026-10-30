@@ -1,0 +1,10 @@
+__pycache__/
+.claude/
+owner/issued.log
+*.command
+*.cmd
+.DS_Store
+# real machine lists stay local (names, tailnet, IPs); see fleet.conf.example
+fleet-watch/fleet.conf
+fleet-watch/fleet.*.conf
+friend-handoff/

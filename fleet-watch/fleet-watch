@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""fleet-watch: keep every Tailscale machine reachable over SSH and T3 Code.
+
+Runs every 5 min on the Mac (launchd com.cuss.fleet-watch) and on Linny (systemd user
+fleet-watch.timer), so the fleet is still watched while the Mac sleeps.
+Config: fleet.<hostname>.conf if present, else fleet.conf.
+  - Inventory comes from `tailscale status --json`, so new machines show up on their own.
+  - Per machine: Tailscale reachability, SSH login, T3 Code HTTP 200, node key expiry.
+  - Safe repairs only: restart T3 (systemd user unit / reopen the Mac app),
+    restore `tailscale serve`, reopen Tailscale on this Mac. Each at most once per 15 min.
+  - Never power-cycles anything. Unreachable machines produce an alert that asks you.
+  - Alerts: macOS notification on every state change, repeated every 6 h while broken.
+    Optional webhook (FLEET_WATCH_WEBHOOK in ~/.config/fleet-watch/env) for the T3 agent.
+
+Usage: fleet-watch [--dry-run] [--status]
+"""
+import fcntl
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+HOST = socket.gethostname().split(".")[0].lower()
+IS_MAC = sys.platform == "darwin"
+CONF = next(p for p in (os.path.join(HERE, f"fleet.{HOST}.conf"), os.path.join(HERE, "fleet.conf"))
+            if os.path.isfile(p))
+STATE_DIR = os.path.expanduser("~/.local/state/fleet-watch")
+STATE = os.path.join(STATE_DIR, "state.json")
+STATUS_MD = os.path.join(STATE_DIR, "STATUS.md")
+LOG = os.path.expanduser("~/Library/Logs/fleet-watch.log" if IS_MAC
+                         else "~/.local/state/fleet-watch/fleet-watch.log")
+ENV_FILE = os.path.expanduser("~/.config/fleet-watch/env")
+
+REMIND_EVERY = 6 * 3600
+REPAIR_COOLDOWN = 15 * 60
+KEY_EXPIRY_WARN_DAYS = 14
+T3_SESSION_WARN_DAYS = 7
+ALERTING_ROLES = {"self", "server", "box"}  # "laptop": alert only when online but broken
+
+DRY_RUN = "--dry-run" in sys.argv
+NOW = time.time()
+
+
+def sh(cmd, timeout=30):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 124, "timeout"
+
+
+def tailscale_bin():
+    return shutil.which("tailscale") or "/usr/local/bin/tailscale"
+
+
+def log(line):
+    if DRY_RUN:
+        return
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(f"{datetime.now():%F %T} {line}\n")
+
+
+def notify(title, body):
+    if DRY_RUN:
+        print(f"[notify] {title}: {body}")
+        return
+    if not IS_MAC:  # Linux watcher alerts through the webhook only
+        return
+    esc = lambda s: s.replace("\\", "\\\\").replace('"', '\\"')
+    sh(["osascript", "-e",
+        f'display notification "{esc(body)}" with title "{esc(title)}" sound name "Basso"'])
+
+
+def load_env():
+    env = {}
+    if os.path.isfile(ENV_FILE):
+        for line in open(ENV_FILE):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"')
+    return env
+
+
+PENDING = os.path.join(STATE_DIR, "pending-webhook.json")
+
+
+def webhook(url, events):
+    """POST events; on failure keep them in PENDING and resend them with the next run's events."""
+    if not url or DRY_RUN:
+        return
+    queued = json.load(open(PENDING)) if os.path.isfile(PENDING) else []
+    events = (queued + events)[-50:]
+    if not events:
+        return
+    # curl, not urllib: the T3 relay answers 403 to Python's default client
+    for attempt in range(3):
+        rc, out = sh(["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "-m", "15", "-X", "POST",
+                      "-H", "Content-Type: application/json",
+                      "--data", json.dumps({"source": "fleet-watch", "watcher": HOST, "events": events}),
+                      url], 20)
+        if out.startswith("2"):
+            if queued:
+                os.remove(PENDING)
+                log(f"webhook: delivered {len(queued)} queued event(s)")
+            return
+        time.sleep(10)
+    json.dump(events, open(PENDING, "w"))
+    log(f"webhook failed: rc={rc} http={out[:80]}; {len(events)} event(s) queued for next run")
+
+
+def load_conf():
+    machines = {}
+    for line in open(CONF):
+        line = line.split("#", 1)[0].split()
+        if len(line) == 5:
+            name, role, ssh, t3, repair = [None if x == "-" else x for x in line]
+            machines[name.lower()] = dict(role=role, ssh=ssh, t3=t3, repair=repair)
+    return machines
+
+
+def http_code(url):
+    rc, out = sh(["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "15", url], 20)
+    return out if rc == 0 else "000"
+
+
+def ssh_ok(alias):
+    rc, out = sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", alias, "true"], 20)
+    return rc == 0, out.splitlines()[-1] if out else ""
+
+
+def ts_ping(ip):
+    rc, _ = sh([tailscale_bin(), "ping", "-c", "2", "--timeout", "4s", ip], 15)
+    return rc == 0
+
+
+def days_until(iso):
+    if not iso or iso.startswith("0001"):
+        return None
+    t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    return (t - datetime.now(timezone.utc)).total_seconds() / 86400
+
+
+def ago(iso):
+    if not iso or iso.startswith("0001"):
+        return "unknown"
+    s = (datetime.now(timezone.utc) - datetime.fromisoformat(iso.replace("Z", "+00:00"))).total_seconds()
+    return f"{s/60:.0f}m ago" if s < 3600 else f"{s/3600:.1f}h ago" if s < 86400 else f"{s/86400:.0f}d ago"
+
+
+def repair(m, name, state, notes):
+    """Attempt the configured safe repair once per cooldown. Returns True if attempted."""
+    last = state.get("last_repair", 0)
+    if NOW - last < REPAIR_COOLDOWN or not m["repair"]:
+        return False
+    if DRY_RUN:
+        notes.append(f"would repair ({m['repair']})")
+        return False
+    state["last_repair"] = NOW
+    if m["repair"] == "systemd-local":
+        sh(["systemctl", "--user", "restart", "t3code.service"], 40)
+        time.sleep(20)
+    elif m["repair"] == "systemd-user" and m["ssh"]:
+        sh(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", m["ssh"],
+            "systemctl --user restart t3code.service; "
+            "tailscale serve status 2>/dev/null | grep -q 3773 || tailscale serve --bg 3773"], 40)
+        time.sleep(20)
+    elif m["repair"] == "mac-app":
+        sh(["open", "-ga", "T3 Code (Beta)"])
+        time.sleep(45)  # T3 server needs ~45 s to boot
+    else:
+        return False
+    log(f"{name}: repair attempted ({m['repair']})")
+    notes.append(f"repair attempted ({m['repair']})")
+    return True
+
+
+def t3_session_problems():
+    """On a host running the T3 server, warn before paired clients (phone, Mac) get logged out."""
+    import glob
+    bins = sorted(glob.glob(os.path.expanduser("~/.t3/runtime/versions/*/t3")))
+    if IS_MAC or not bins:
+        return []
+    rc, out = sh([bins[-1], "auth", "session", "list"], 30)
+    if rc != 0:
+        return []
+    problems, client = [], None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("client:"):
+            client = line.split(":", 1)[1].split("|")[0].strip()
+        elif line.startswith("expires:") and client:
+            left = days_until(line.split(":", 1)[1].strip())
+            if left is not None and left < T3_SESSION_WARN_DAYS:
+                problems.append(f"T3 login for '{client}' expires in {left:.0f} days - re-pair it")
+    return problems
+
+
+def check(name, node, m, is_self, backend_state, state):
+    problems, notes = [], []
+    ip = node["TailscaleIPs"][0]
+
+    if is_self:
+        reachable = backend_state == "Running"
+        if not reachable and IS_MAC and not DRY_RUN and NOW - state.get("last_repair", 0) > REPAIR_COOLDOWN:
+            state["last_repair"] = NOW
+            sh(["open", "-ga", "Tailscale"])
+            time.sleep(10)
+            rc, out = sh([tailscale_bin(), "status", "--json"])
+            reachable = rc == 0 and json.loads(out).get("BackendState") == "Running"
+            notes.append("reopened Tailscale")
+        if not reachable:
+            problems.append(f"Tailscale on this Mac is {backend_state}")
+    else:
+        reachable = bool(node.get("Online")) or ts_ping(ip)
+
+    if not reachable and not is_self:
+        return "down", [f"unreachable on Tailscale (last seen {ago(node.get('LastSeen'))})"], notes
+
+    if m["ssh"]:
+        ok, err = ssh_ok(m["ssh"])
+        if not ok:
+            problems.append(f"SSH '{m['ssh']}' failed: {err[:80]}")
+
+    if m["t3"]:
+        code = http_code(m["t3"])
+        if code != "200":  # right after the Mac wakes, T3 can lag; confirm before repairing
+            time.sleep(20)
+            code = http_code(m["t3"])
+        if code != "200" and repair(m, name, state, notes):
+            code = http_code(m["t3"])
+        if code != "200":
+            problems.append(f"T3 Code not responding (http {code}) at {m['t3']}")
+
+    if is_self:
+        problems += t3_session_problems()
+
+    left = days_until(node.get("KeyExpiry"))
+    if left is not None and left < KEY_EXPIRY_WARN_DAYS:
+        problems.append(f"Tailscale key expires in {left:.0f} days - disable key expiry in admin console")
+
+    return ("degraded" if problems else "up"), problems, notes
+
+
+def main():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if "--status" in sys.argv:
+        print(open(STATUS_MD).read() if os.path.isfile(STATUS_MD) else "no status yet")
+        return
+    lock = open(os.path.join(STATE_DIR, ".lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return  # previous run still going
+
+    env = load_env()
+    conf = load_conf()
+    saved = json.load(open(STATE)) if os.path.isfile(STATE) else {}
+
+    rc, out = sh([tailscale_bin(), "status", "--json"])
+    if rc != 0:
+        msg = f"tailscale status failed: {out[:120]}"
+        log(msg)
+        notify("fleet-watch: Tailscale broken on Mac", msg)
+        return
+    ts = json.loads(out)
+    nodes = [(ts["Self"], True)] + [(p, False) for p in ts.get("Peer", {}).values()]
+
+    rows, events = [], []
+    for node, is_self in nodes:
+        name = node["DNSName"].split(".")[0].lower()
+        st = saved.get(name, {})
+        m = conf.get(name)
+        if m is None:
+            status, problems, notes = "unconfigured", ["new machine - add it to fleet.conf"], []
+            role = "?"
+        else:
+            role = m["role"]
+            status, problems, notes = check(name, node, m, is_self, ts.get("BackendState"), st)
+
+        prev = st.get("status")
+        # Debounce: any move into a bad state must repeat on the next run before it counts.
+        # Laptops in dark/maintenance wake look online-but-broken for a few minutes.
+        if prev is not None and prev != status and status in ("down", "degraded"):
+            if st.get("pending") != status:
+                st["pending"] = status
+                log(f"{name}: {status} once, confirming next run ({'; '.join(problems)})")
+                status, problems = prev, [f"unconfirmed {status}: {problems[0]}"]
+            else:
+                st.pop("pending", None)
+        else:
+            st.pop("pending", None)
+        alerting = (role in ALERTING_ROLES or status == "unconfigured"
+                    or (role == "laptop" and (status == "degraded" or prev == "degraded")))
+        changed = status != prev
+        if changed:
+            st["since"] = NOW
+            log(f"{name}: {prev} -> {status} {'; '.join(problems + notes)}")
+        if prev is None:
+            should_alert = status != "up"  # first sighting: report only what is already broken
+        elif changed:
+            should_alert = True
+        else:  # still broken: remind louder every REMIND_EVERY, but never re-nag "unconfigured"
+            should_alert = status in ("down", "degraded") and NOW - st.get("last_alert", 0) > REMIND_EVERY
+        if alerting and should_alert:
+            if status == "up":
+                title, body = f"{name} is back", "SSH and T3 Code healthy again."
+            elif status == "down":
+                title = f"{name} is UNREACHABLE"
+                body = f"{problems[0]}. Not power-cycling - check power/network, or tell the agent to."
+            else:
+                title, body = f"{name}: {status}", "; ".join(problems)
+            notify(title, body)
+            events.append(dict(machine=name, role=role, status=status, previous=prev,
+                               problems=problems, notes=notes))
+            st["last_alert"] = NOW
+        st["status"] = status
+        saved[name] = st
+        since = datetime.fromtimestamp(st["since"]).strftime("%m-%d %H:%M") if st.get("since") else ""
+        rows.append(f"| {name} | {role} | {node['OS']} | **{status}** since {since} | "
+                    f"{'; '.join(problems + notes) or 'ok'} |")
+
+    if env.get("FLEET_WATCH_WEBHOOK_SELF_ONLY") == "1":  # another watcher (Linny) reports the fleet
+        events = [e for e in events if e["role"] == "self"]
+    webhook(env.get("FLEET_WATCH_WEBHOOK"), events)
+    if not DRY_RUN:
+        json.dump(saved, open(STATE, "w"), indent=1)
+    md = (f"# Fleet status - {datetime.now():%F %T}\n\n"
+          "| machine | role | os | status | detail |\n|--|--|--|--|--|\n" + "\n".join(rows) + "\n")
+    if not DRY_RUN:
+        open(STATUS_MD, "w").write(md)
+    print(md)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,101 @@
+#!/bin/bash
+# onboard-machine <tailscale-name> <remote-user> [--dry-run]
+# Run on the Mac after a friend's join script finishes. Over SSH it sets the machine up
+# like Linny: user-local Node, T3 Code background service, self-heal timer (Linux),
+# tailscale serve, Claude CLI. Then adds it to fleet-watch and prints a T3 pairing link.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+FW="$HERE/../fleet-watch"
+NAME="${1:?usage: onboard-machine <name> <user> [--dry-run]}"; RUSER="${2:?remote user}"
+DRY="${3:-}"
+TAILNET=$(tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["MagicDNSSuffix"])')
+NODE_VER=v22.20.0
+
+# 1. ssh alias (backup first)
+if ! grep -qE "^Host ${NAME}( |$)" ~/.ssh/config; then
+  cp -p ~/.ssh/config ~/.ssh/config.bak-$(date +%F-%H%M%S)
+  printf '\nHost %s\n  HostName %s.%s\n  User %s\n  IdentityFile ~/.ssh/id_ed25519\n  IdentitiesOnly yes\n' \
+    "$NAME" "$NAME" "$TAILNET" "$RUSER" >> ~/.ssh/config
+  echo "added ssh alias '$NAME'"
+fi
+ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new "$NAME" true \
+  || { echo "SSH to $NAME failed - is Remote Login/sshd on and the key installed?"; exit 1; }
+OS=$(ssh "$NAME" uname -s 2>/dev/null | tr -d "\r" || true); [ -n "$OS" ] || OS=Windows
+echo "connected: $NAME ($OS)"
+
+read -r -d '' REMOTE <<'EOS' || true
+set -euo pipefail
+NODE_VER=__NODE_VER__; OS=$(uname -s); ARCH=$(uname -m)
+case "$OS-$ARCH" in
+  Linux-x86_64) P=linux-x64;; Linux-aarch64) P=linux-arm64;;
+  Darwin-arm64) P=darwin-arm64;; Darwin-x86_64) P=darwin-x64;; *) echo "unsupported $OS-$ARCH"; exit 1;;
+esac
+mkdir -p ~/.local/bin
+if [ ! -x ~/.local/node/bin/node ]; then
+  echo "installing Node $NODE_VER ($P)"
+  curl -fsSL "https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-$P.tar.xz" | tar -xJ -C ~/.local
+  rm -rf ~/.local/node && mv ~/.local/node-$NODE_VER-$P ~/.local/node
+fi
+export PATH="$HOME/.local/bin:$HOME/.local/node/bin:$PATH"
+node --version
+command -v claude >/dev/null || { echo "installing Claude Code CLI"; npm i -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "claude CLI install failed (non-fatal)"; }
+
+echo "installing T3 Code service"
+npx -y t3@latest service install
+if [ "$OS" = Linux ]; then
+  mkdir -p ~/.config/systemd/user/t3code.service.d
+  printf '[Service]\nEnvironment=PATH=%s/.local/bin:%s/.local/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin\n' "$HOME" "$HOME" \
+    > ~/.config/systemd/user/t3code.service.d/path.conf
+  cat > ~/.local/bin/t3-heal <<'H'
+#!/bin/bash
+# Keeps T3 Code reachable on this box. Runs every 2 min via t3-heal.timer.
+code=$(curl -s -o /dev/null -w "%{http_code}" -m 10 http://127.0.0.1:3773/ || echo 000)
+if [ "$code" != "200" ]; then
+  echo "$(date -Is) t3 unhealthy ($code) - restarting"
+  systemctl --user restart t3code.service
+fi
+if ! tailscale serve status 2>/dev/null | grep -q 3773; then
+  echo "$(date -Is) tailscale serve missing - restoring"
+  tailscale serve --bg 3773 >/dev/null 2>&1
+fi
+H
+  chmod +x ~/.local/bin/t3-heal
+  printf '[Unit]\nDescription=Keep T3 Code healthy\n[Service]\nType=oneshot\nExecStart=%%h/.local/bin/t3-heal\n' > ~/.config/systemd/user/t3-heal.service
+  printf '[Unit]\nDescription=Run t3-heal every 2 minutes\n[Timer]\nOnBootSec=1min\nOnUnitActiveSec=2min\nPersistent=true\n[Install]\nWantedBy=timers.target\n' > ~/.config/systemd/user/t3-heal.timer
+  systemctl --user daemon-reload
+  systemctl --user restart t3code.service
+  systemctl --user enable --now t3-heal.timer
+  TS=tailscale
+else
+  TS=/Applications/Tailscale.app/Contents/MacOS/Tailscale
+fi
+for i in $(seq 1 30); do [ "$(curl -s -o /dev/null -w '%{http_code}' -m 5 http://127.0.0.1:3773/)" = 200 ] && break; sleep 5; done
+curl -s -o /dev/null -w "T3 local: HTTP %{http_code}\n" -m 5 http://127.0.0.1:3773/
+"$TS" serve --bg 3773 >/dev/null 2>&1 || echo "tailscale serve failed (HTTPS certs may be off for the tailnet)"
+T3=$(ls -d ~/.t3/runtime/versions/*/t3 2>/dev/null | tail -1)
+[ -n "$T3" ] || T3="npx -y t3@latest"
+cd ~ && $T3 pair --tailscale --label "Cuss Mac" --ttl 30m 2>&1 | grep -E "Pairing URL|Expires"
+EOS
+REMOTE="${REMOTE/__NODE_VER__/$NODE_VER}"
+
+if [ "$OS" = Windows ]; then
+  # The join script already installed T3 + its startup task on Windows; just verify and pair.
+  WIN_PAIR='$t3 = "$env:APPDATA\npm\t3.cmd"; Set-Location $HOME; & $t3 pair --tailscale --label "Cuss Mac" --ttl 30m 2>&1 | Select-String "Pairing URL|Expires"'
+  if [ "$DRY" = --dry-run ]; then echo "$WIN_PAIR"; exit 0; fi
+  ssh "$NAME" "(Invoke-WebRequest http://127.0.0.1:3773/ -UseBasicParsing -TimeoutSec 10).StatusCode" || echo "T3 not answering locally yet"
+  ssh "$NAME" "$WIN_PAIR" | tee "/tmp/onboard-$NAME.log"
+else
+  if [ "$DRY" = --dry-run ]; then echo "$REMOTE"; exit 0; fi
+  ssh "$NAME" bash -s <<< "$REMOTE" | tee "/tmp/onboard-$NAME.log"
+fi
+
+# 2. fleet-watch on both watchers
+URL="https://${NAME}.${TAILNET}/"
+case "$OS" in Darwin) ROLE=laptop; REPAIR=-;; Windows) ROLE=box; REPAIR=-;; *) ROLE=box; REPAIR=systemd-user;; esac
+grep -qE "^${NAME} " "$FW/fleet.conf" || \
+  printf '%-21s %-7s %-8s %-35s %s\n' "$NAME" "$ROLE" "$NAME" "$URL" "$REPAIR" >> "$FW/fleet.conf"
+grep -qE "^${NAME} " "$FW/fleet.linny.conf" || \
+  printf '%-21s %-7s %-4s %-31s %s\n' "$NAME" "$ROLE" "-" "$URL" "-" >> "$FW/fleet.linny.conf"
+"$FW/deploy-linny.sh" | grep -E "^\| ${NAME} " || true
+curl -s -o /dev/null -w "T3 over tailnet: HTTP %{http_code}\n" -m 15 "$URL"
+echo "fleet-watch: added $NAME ($ROLE) on Mac + Linny"
