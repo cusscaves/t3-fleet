@@ -218,7 +218,9 @@ def check(name, node, m, is_self, backend_state, state):
         if not reachable:
             problems.append(f"Tailscale on this Mac is {backend_state}")
     else:
-        reachable = bool(node.get("Online")) or ts_ping(ip)
+        # Tailscale's Online flag lags minutes behind a laptop closing its lid; a sleeping
+        # machine then looks "online but T3 broken". Only a live ping counts as reachable.
+        reachable = ts_ping(ip)
 
     if not reachable and not is_self:
         return "down", [f"unreachable on Tailscale (last seen {ago(node.get('LastSeen'))})"], notes
